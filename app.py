@@ -1,89 +1,97 @@
 import streamlit as st
-import paho.mqtt.client as mqtt
+import tornado.web
 import json
 import time
 from datetime import datetime
 
 st.set_page_config(page_title="Zero-Trust Smart Lock", page_icon="🔐", layout="centered")
 
-# Unique MQTT Topic Prefix (Change "mca_zt_lock_9921" to any secret word of your choice!)
-TOPIC_PREFIX = "mca_zt_lock_9921"
-BROKER = "broker.hivemq.com"
+# 1. SHARED CLOUD MEMORY (Persists across all phone & ESP8266 requests)
+@st.cache_resource
+def get_cloud_state():
+    return {
+        "users": {
+            "MCA-Admin": {"role": "Admin", "active": True},
+            "Prof-Evaluator": {"role": "Faculty", "active": True}
+        },
+        "telemetry": {
+            "code": "------",
+            "door_closed": False,
+            "locked": True,
+            "intrusion": False,
+            "last_seen": 0
+        },
+        "unlock_command": False,
+        "logs": []
+    }
 
-# Initialize Cloud Memory (Users, Telemetry, Logs)
-if "users" not in st.session_state:
-    st.session_state.users = {
-        "MCA-Admin": {"role": "Admin", "active": True},
-        "Prof-Evaluator": {"role": "Faculty", "active": True}
-    }
-if "telemetry" not in st.session_state:
-    st.session_state.telemetry = {
-        "code": "------",
-        "door_closed": False,
-        "locked": True,
-        "intrusion": False,
-        "last_seen": 0
-    }
-if "logs" not in st.session_state:
-    st.session_state.logs = []
+STATE = get_cloud_state()
 
 def log_event(user, status, detail, latency_ms=None):
     ts = datetime.now().strftime("%H:%M:%S")
     lat_str = f" | RTT: {latency_ms}ms" if latency_ms else ""
-    st.session_state.logs.insert(0, f"`[{ts}]` **{user}** → **{status}**: {detail}{lat_str}")
+    STATE["logs"].insert(0, f"`[{ts}]` **{user}** → **{status}**: {detail}{lat_str}")
+    STATE["logs"] = STATE["logs"][:15]
 
-# Fetch latest telemetry from ESP8266 via MQTT
-def sync_mqtt():
-    def on_message(client, userdata, msg):
+# 2. BUILT-IN REST API ENDPOINT FOR ESP8266 (/api/sync)
+class DeviceSyncHandler(tornado.web.RequestHandler):
+    def post(self):
         try:
-            data = json.loads(msg.payload.decode())
-            st.session_state.telemetry.update(data)
-            st.session_state.telemetry["last_seen"] = time.time()
-        except Exception:
-            pass
+            data = json.loads(self.request.body.decode("utf-8"))
+            STATE["telemetry"]["code"] = str(data.get("code", "------"))
+            STATE["telemetry"]["door_closed"] = bool(data.get("door_closed", False))
+            STATE["telemetry"]["locked"] = bool(data.get("locked", True))
+            STATE["telemetry"]["intrusion"] = bool(data.get("intrusion", False))
+            STATE["telemetry"]["last_seen"] = time.time()
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    client.on_message = on_message
-    client.connect(BROKER, 1883, 60)
-    client.subscribe(f"{TOPIC_PREFIX}/telemetry")
-    client.loop_start()
-    time.sleep(0.4)  # Brief listen for retained edge state
-    client.loop_stop()
-    client.disconnect()
+            # Check if cloud approved an unlock command
+            should_unlock = STATE["unlock_command"]
+            if should_unlock:
+                STATE["unlock_command"] = False  # One-time trigger reset
 
-def send_unlock_command():
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-    client.connect(BROKER, 1883, 60)
-    client.publish(f"{TOPIC_PREFIX}/command", json.dumps({"action": "UNLOCK"}))
-    client.disconnect()
+            self.set_header("Content-Type", "application/json")
+            self.write(json.dumps({"unlock": should_unlock}))
+        except Exception as e:
+            self.set_status(400)
+            self.write(json.dumps({"error": str(e)}))
 
-sync_mqtt()
-tel = st.session_state.telemetry
-is_online = (time.time() - tel["last_seen"]) < 15
+@st.cache_resource
+def register_api_route():
+    # Attach /api/sync directly to Streamlit's underlying Tornado server
+    for obj in gc.get_objects():
+        if isinstance(obj, tornado.web.Application):
+            obj.add_handlers(r".*", [(r"/api/sync", DeviceSyncHandler)])
+            return True
+    return False
 
-# --- UI HEADER ---
+import gc
+register_api_route()
+
+# --- 3. STREAMLIT CLOUD DASHBOARD UI ---
+tel = STATE["telemetry"]
+is_online = (time.time() - tel["last_seen"]) < 10
+
 st.title("🔐 Zero-Trust Cyber-Physical Smart Lock")
-st.caption("Cloud Policy Engine (Streamlit Cloud) + Edge Telemetry (NodeMCU ESP8266 via MQTT)")
+st.caption("Standalone Pure-Python Cloud Policy Engine (Streamlit) + NodeMCU ESP8266")
 
-# --- LIVE EDGE TELEMETRY ---
 col1, col2, col3 = st.columns(3)
 col1.metric("Edge Node", "🟢 ONLINE" if is_online else "🔴 OFFLINE")
 col2.metric("IR Door Sensor", "🚪 CLOSED" if tel["door_closed"] else "⚠️ OPEN")
 col3.metric("Bolt State", "🔒 LOCKED" if tel["locked"] else "🔓 UNLOCKED")
 
-if tel.get("intrusion"):
+if tel["intrusion"]:
     st.error("🚨 CRITICAL ALERT: Forced-entry intrusion detected while bolt was locked!")
 
 st.divider()
 
 # --- ZERO-TRUST UNLOCK PORTAL ---
 st.subheader("1. Zero-Trust Physical Presence Verification")
-selected_user = st.selectbox("Select Identity", list(st.session_state.users.keys()))
+selected_user = st.selectbox("Select Identity", list(STATE["users"].keys()))
 entered_code = st.text_input("Enter 6-Digit Rolling Code from OLED Display", max_chars=6, placeholder="e.g. 482910")
 
 if st.button("Verify Policy & Unlock Door", type="primary", use_container_width=True):
     start_t = time.time()
-    user_info = st.session_state.users.get(selected_user)
+    user_info = STATE["users"].get(selected_user)
 
     # Zero-Trust Check 1: Identity & Revocation
     if not user_info or not user_info["active"]:
@@ -107,44 +115,44 @@ if st.button("Verify Policy & Unlock Door", type="primary", use_container_width=
 
     # ALL ZERO-TRUST CHECKS PASSED!
     else:
-        send_unlock_command()
+        STATE["unlock_command"] = True
         rtt = int((time.time() - start_t) * 1000)
         log_event(selected_user, "GRANTED", f"Verified {user_info['role']} + OLED token", rtt)
-        st.success(f"✅ ZERO-TRUST VERIFIED! Unlock signal dispatched in {rtt} ms.")
+        st.success(f"✅ ZERO-TRUST VERIFIED! Unlock command queued ({rtt} ms).")
 
 st.divider()
 
-# --- ADMIN IAM & REVOCATION PANEL ---
+# --- CLOUD IAM PANEL ---
 st.subheader("2. Cloud IAM: User Creation & Real-Time Revocation")
 c1, c2, c3 = st.columns([2, 1.5, 1])
 new_user = c1.text_input("New Username", placeholder="e.g. Student-01", label_visibility="collapsed")
 new_role = c2.selectbox("Role", ["Student", "Faculty", "Guest"], label_visibility="collapsed")
 if c3.button("Add User", use_container_width=True) and new_user.strip():
-    st.session_state.users[new_user.strip()] = {"role": new_role, "active": True}
+    STATE["users"][new_user.strip()] = {"role": new_role, "active": True}
     log_event("ADMIN", "IAM_CREATE", f"Added {new_user.strip()} ({new_role})")
     st.rerun()
 
-for uname, info in st.session_state.users.items():
+for uname, info in STATE["users"].items():
     ucol1, ucol2, ucol3 = st.columns([2.5, 1.5, 1.2])
     ucol1.write(f"**{uname}** (`{info['role']}`)")
     ucol2.write("🟢 Active" if info["active"] else "🔴 Suspended")
     btn_label = "Revoke" if info["active"] else "Restore"
     if ucol3.button(btn_label, key=f"btn_{uname}", use_container_width=True):
-        st.session_state.users[uname]["active"] = not info["active"]
-        state_txt = "RESTORED" if st.session_state.users[uname]["active"] else "REVOKED"
+        STATE["users"][uname]["active"] = not info["active"]
+        state_txt = "RESTORED" if STATE["users"][uname]["active"] else "REVOKED"
         log_event("ADMIN", f"IAM_{state_txt}", f"Changed {uname} access")
         st.rerun()
 
 st.divider()
 
-# --- AUDIT LOGS & REFRESH ---
+# --- AUDIT LOGS ---
 col_log, col_ref = st.columns([3, 1])
 col_log.subheader("3. Zero-Trust Audit Trail")
 if col_ref.button("🔄 Refresh Telemetry", use_container_width=True):
     st.rerun()
 
-if st.session_state.logs:
-    for entry in st.session_state.logs[:12]:
+if STATE["logs"]:
+    for entry in STATE["logs"]:
         st.markdown(entry)
 else:
     st.info("No access attempts recorded yet.")
